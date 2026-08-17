@@ -1,0 +1,94 @@
+From 9c75a96c44ac340da38566686eb1b49285b612e4 Mon Sep 17 00:00:00 2001
+From: Codex Experimental <codex@localhost>
+Date: Mon, 17 Aug 2026 04:56:20 -0300
+Subject: [PATCH] ntoskrnl: emulate cmp and test reads from shared user data
+
+---
+ dlls/ntoskrnl.exe/instr.c | 64 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 64 insertions(+)
+
+diff --git a/dlls/ntoskrnl.exe/instr.c b/dlls/ntoskrnl.exe/instr.c
+index 03f48152b94..8174bdb4fe2 100644
+--- a/dlls/ntoskrnl.exe/instr.c
++++ b/dlls/ntoskrnl.exe/instr.c
+@@ -509,6 +509,48 @@ static inline int get_op_size( int long_op, int rex )
+         return sizeof(WORD);
+ }
+ 
++#define X86_EFLAGS_CF 0x0001
++#define X86_EFLAGS_PF 0x0004
++#define X86_EFLAGS_AF 0x0010
++#define X86_EFLAGS_ZF 0x0040
++#define X86_EFLAGS_SF 0x0080
++#define X86_EFLAGS_OF 0x0800
++
++static BOOL even_parity( BYTE value )
++{
++    value ^= value >> 4;
++    value &= 0x0f;
++    return !((0x6996 >> value) & 1);
++}
++
++static void set_cmp32_flags( CONTEXT *context, DWORD left, DWORD right )
++{
++    DWORD result = left - right;
++    DWORD flags = 0;
++
++    if (left < right) flags |= X86_EFLAGS_CF;
++    if (even_parity( result )) flags |= X86_EFLAGS_PF;
++    if ((left ^ right ^ result) & 0x10) flags |= X86_EFLAGS_AF;
++    if (!result) flags |= X86_EFLAGS_ZF;
++    if (result & 0x80000000) flags |= X86_EFLAGS_SF;
++    if ((left ^ right) & (left ^ result) & 0x80000000) flags |= X86_EFLAGS_OF;
++
++    context->EFlags = (context->EFlags & ~(X86_EFLAGS_CF | X86_EFLAGS_PF | X86_EFLAGS_AF |
++            X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_OF)) | flags;
++}
++
++static void set_test32_flags( CONTEXT *context, DWORD result )
++{
++    DWORD flags = 0;
++
++    if (even_parity( result )) flags |= X86_EFLAGS_PF;
++    if (!result) flags |= X86_EFLAGS_ZF;
++    if (result & 0x80000000) flags |= X86_EFLAGS_SF;
++
++    context->EFlags = (context->EFlags & ~(X86_EFLAGS_CF | X86_EFLAGS_PF | X86_EFLAGS_ZF |
++            X86_EFLAGS_SF | X86_EFLAGS_OF)) | flags;
++}
++
+ /* store an operand into a register */
+ static void store_reg_word( CONTEXT *context, BYTE regmodrm, const BYTE *addr, int long_op, int rex,
+         enum instr_op op )
+@@ -885,6 +927,28 @@ static DWORD emulate_instruction( EXCEPTION_RECORD *rec, CONTEXT *context )
+         break;  /* Unable to emulate it */
+     }
+ 
++    case 0x3b: /* cmp r32, r/m32 */
++    case 0x85: /* test r/m32, r32 */
++    {
++        BYTE *data;
++        DWORD memory, reg;
++        SIZE_T offset;
++
++        if (!long_op || (rex & REX_W)) break;
++        data = INSTR_GetOperandAddr( context, instr + 1, prefixlen + 1, long_addr,
++                                    rex, segprefix, &len );
++        offset = data - user_shared_data;
++        if (offset > KSHARED_USER_DATA_PAGE_SIZE - sizeof(memory)) break;
++
++        memcpy( &memory, wine_user_shared_data + offset, sizeof(memory) );
++        reg = *(DWORD *)get_int_reg( context, REGMODRM_REG( instr[1], rex ) );
++        TRACE("USD offset %#x at %p.\n", (unsigned int)offset, (void *)context->Rip);
++        if (*instr == 0x3b) set_cmp32_flags( context, reg, memory );
++        else set_test32_flags( context, memory & reg );
++        context->Rip += prefixlen + len + 1;
++        return ExceptionContinueExecution;
++    }
++
+     case 0xa0: /* mov Ob, AL */
+     case 0xa1: /* mov Ovqp, rAX */
+     {
+-- 
+2.55.0
+
