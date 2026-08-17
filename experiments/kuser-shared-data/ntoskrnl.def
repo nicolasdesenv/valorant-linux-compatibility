@@ -1,0 +1,8 @@
+LIBRARY ntoskrnl.exe
+EXPORTS
+ DbgPrint
+ IoCreateDevice
+    IoCreateDeviceSecure
+    IoCreateSymbolicLink
+    RtlInitUnicodeString
+    IofCompleteRequest

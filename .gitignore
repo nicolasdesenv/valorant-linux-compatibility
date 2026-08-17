@@ -1,0 +1,21 @@
+# Generated research output (may contain paths or sensitive application data)
+logs/*
+!logs/.gitkeep
+
+# Isolated prefixes and local build/source trees
+.state/
+build/
+sources/
+*.log
+*.sys
+*.exe
+*.dll
+*.a
+*.o
+link-client-result.txt
+
+# Editors and operating systems
+.idea/
+.vscode/
+*~
+.DS_Store

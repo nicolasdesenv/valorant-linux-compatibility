@@ -1,0 +1,3 @@
+#include <windows.h>
+static void run(const char *tag) { HANDLE h=CreateFileW(L"\\\\.\\WineSecureProbe",GENERIC_READ,0,NULL,OPEN_EXISTING,0,NULL); DWORD e=GetLastError(); char b[200]; wsprintfA(b,"%s CreateFile=%s err=%lu",tag,h==INVALID_HANDLE_VALUE?"FAIL":"PASS",e); OutputDebugStringA(b); if(h!=INVALID_HANDLE_VALUE) CloseHandle(h); }
+int main(void) { HANDLE t=0,r=0; run("CONTROL token=normal"); OpenProcessToken(GetCurrentProcess(),TOKEN_DUPLICATE|TOKEN_QUERY,&t); if(!CreateRestrictedToken(t,DISABLE_MAX_PRIVILEGE,0,0,0,0,0,0,&r)) return 2; SetThreadToken(NULL,r); run("DENY token=restricted nonSYSTEM"); RevertToSelf(); CloseHandle(r); CloseHandle(t); return 0; }
