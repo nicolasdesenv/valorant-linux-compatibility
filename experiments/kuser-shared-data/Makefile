@@ -11,7 +11,7 @@ MATRIX_DRIVERS := \
 	ksd-mov8.sys ksd-mov16.sys ksd-mov32.sys ksd-mov64.sys \
 	ksd-movzx8.sys ksd-movzx16.sys ksd-or32.sys ksd-xor32.sys \
 	ksd-cmp32.sys ksd-test32.sys
-DRIVERS := kuser-control.sys kuser-004.sys kuser-320.sys zwload-control.sys zwload-kuser.sys secure-probe.sys link-probe.sys $(MATRIX_DRIVERS)
+DRIVERS := kuser-control.sys kuser-004.sys kuser-320.sys zwload-control.sys zwload-kuser.sys secure-probe.sys link-probe.sys driver-ext-probe.sys $(MATRIX_DRIVERS)
 
 .PHONY: all clean inspect
 
@@ -52,6 +52,9 @@ link-probe.sys: link_probe.c libntoskrnl.a
 
 link-client.exe: link_client.c
 	$(WCC) -O2 -Wall -Wextra -Werror -o $@ $< -lkernel32
+
+driver-ext-probe.sys: driver_ext_probe.c libntoskrnl.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L. -lntoskrnl
 
 ksd-mov8.sys: instruction_probe.c libntoskrnl.a
 	$(CC) $(CFLAGS) -DPROBE_KIND=1 -DPROBE_OFFSET=0x268 -DPROBE_WIDTH=8 -DPROBE_NAME='"mov8"' $(LDFLAGS) -o $@ $< -L. -lntoskrnl
