@@ -1,9 +1,16 @@
+ifeq ($(shell command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 && echo yes),yes)
 CC := x86_64-w64-mingw32-gcc
 DLLTOOL := x86_64-w64-mingw32-dlltool
 OBJDUMP := x86_64-w64-mingw32-objdump
 WCC := x86_64-w64-mingw32-gcc
+else
+CC := clang --target=x86_64-w64-mingw32 -fuse-ld=lld
+DLLTOOL := llvm-dlltool
+OBJDUMP := llvm-objdump
+WCC := clang --target=x86_64-w64-mingw32 -fuse-ld=lld
+endif
 
-CFLAGS := -O0 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector
+CFLAGS := -O0 -Wall -Wextra -Werror -ffreestanding -fno-stack-protector -fno-builtin -mno-stack-arg-probe
 LDFLAGS := -nostdlib -nodefaultlibs -nostartfiles \
 	-Wl,--subsystem,native -Wl,--entry,DriverEntry -Wl,--image-base,0x140000000
 
@@ -11,11 +18,23 @@ MATRIX_DRIVERS := \
 	ksd-mov8.sys ksd-mov16.sys ksd-mov32.sys ksd-mov64.sys \
 	ksd-movzx8.sys ksd-movzx16.sys ksd-or32.sys ksd-xor32.sys \
 	ksd-cmp32.sys ksd-test32.sys
-DRIVERS := kuser-control.sys kuser-004.sys kuser-320.sys zwload-control.sys zwload-kuser.sys secure-probe.sys link-probe.sys $(MATRIX_DRIVERS)
+# Probes that only need ntoskrnl.def (buildable in CI without Wine headers)
+STANDALONE_DRIVERS := kuser-control.sys kuser-004.sys kuser-320.sys zwload-control.sys zwload-kuser.sys driver-ext-probe.sys $(MATRIX_DRIVERS)
+# Probes that include Wine DDK headers (need WINE_INCLUDE=/path/to/wine/include)
+WINE_DDK_DRIVERS := secure-probe.sys link-probe.sys
+DRIVERS := $(STANDALONE_DRIVERS) $(WINE_DDK_DRIVERS)
+ifdef WINE_INCLUDE
+CFLAGS += -I$(WINE_INCLUDE)
+endif
+USER_CLIENTS := secure-client.exe secure-deny-client.exe secure-matrix-client.exe link-client.exe
 
-.PHONY: all clean inspect
+.PHONY: all standalone clients clean inspect
 
 all: $(DRIVERS)
+
+standalone: $(STANDALONE_DRIVERS)
+
+clients: $(USER_CLIENTS)
 
 libntoskrnl.a: ntoskrnl.def
 	$(DLLTOOL) --machine i386:x86-64 --input-def $< --output-lib $@
@@ -53,6 +72,9 @@ link-probe.sys: link_probe.c libntoskrnl.a
 link-client.exe: link_client.c
 	$(WCC) -O2 -Wall -Wextra -Werror -o $@ $< -lkernel32
 
+driver-ext-probe.sys: driver_ext_probe.c libntoskrnl.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -L. -lntoskrnl
+
 ksd-mov8.sys: instruction_probe.c libntoskrnl.a
 	$(CC) $(CFLAGS) -DPROBE_KIND=1 -DPROBE_OFFSET=0x268 -DPROBE_WIDTH=8 -DPROBE_NAME='"mov8"' $(LDFLAGS) -o $@ $< -L. -lntoskrnl
 
@@ -88,4 +110,4 @@ inspect: all
 	$(OBJDUMP) -d $(DRIVERS)
 
 clean:
-	rm -f -- $(DRIVERS) libntoskrnl.a
+	rm -f -- $(DRIVERS) $(USER_CLIENTS) libntoskrnl.a

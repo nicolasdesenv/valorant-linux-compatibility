@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Bracket ranges like [A-Za-z] follow locale collation; tr_TR.UTF-8 rejects valid names without this.
+export LC_ALL=C
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 source_dir="$repo_root/sources/proton"

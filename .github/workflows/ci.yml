@@ -1,0 +1,110 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  WINE_PINNED_COMMIT: 81d78e4f3ea8ce868d775021fdc9f90122dc1a6b
+
+jobs:
+  hygiene:
+    name: Repo hygiene and safety boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject binaries, runtime state and raw logs
+        run: python3 tools/compatibility-report.py --format summary --strict
+      - name: Reject personal home paths and obvious secrets
+        run: |
+          if git grep -nE '/home/[a-z][a-z0-9_-]+/' -- ':!*.patch' ':!docs/environment.md'; then
+            echo "::error::Personal home path found in tracked files"; exit 1
+          fi
+          if git grep -nIE '(eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|ssid=|__Secure-|access_token=)'; then
+            echo "::error::Possible token or session cookie found"; exit 1
+          fi
+
+  build-probes:
+    name: Build benign driver probes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 and LLVM tools
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 llvm
+      - name: Build standalone .sys probes with -Werror
+        run: make -C experiments/kuser-shared-data clean standalone
+      - name: Check every .sys is a native PE32+ driver
+        run: |
+          status=0
+          for f in experiments/kuser-shared-data/*.sys; do
+            hdr="$(llvm-readobj --file-headers "$f")"
+            grep -q 'Magic: 0x20B' <<<"$hdr" || { echo "::error file=$f::not PE32+"; status=1; }
+            grep -q 'IMAGE_SUBSYSTEM_NATIVE' <<<"$hdr" || { echo "::error file=$f::subsystem is not Native"; status=1; }
+            imports="$(llvm-readobj --coff-imports "$f" | awk '/Name:/ && /\.(dll|exe)/ {print $2}' | sort -u)"
+            [ -z "$imports" ] || [ "$imports" = "ntoskrnl.exe" ] || { echo "::error file=$f::unexpected imports: $imports"; status=1; }
+          done
+          exit $status
+
+  verify-patches:
+    name: Apply Wine patch queue on pinned base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-fetch pinned Proton Wine (ValveSoftware/wine)
+        run: |
+          git init -q wine && cd wine
+          git remote add origin https://github.com/ValveSoftware/wine.git
+          git sparse-checkout set dlls/ntoskrnl.exe include/ddk
+          git fetch -q --depth 1 --filter=blob:none origin "$WINE_PINNED_COMMIT"
+          git checkout -q FETCH_HEAD
+      - name: Apply patches in order
+        run: |
+          cd wine
+          for p in ../patches/wine/*.patch; do
+            echo "::group::$p"
+            git apply --check --whitespace=error "$p"
+            git apply --whitespace=error "$p"
+            echo "::endgroup::"
+          done
+      - name: Probe imports are not stubs after patching
+        run: |
+          spec=wine/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+          status=0
+          for sym in $(awk 'f && NF && $1 !~ /^;/ {print $1} /^EXPORTS/ {f=1}' experiments/kuser-shared-data/ntoskrnl.def); do
+            if grep -qE "^@ +stub +$sym\$" "$spec"; then echo "::error::$sym is still @ stub"; status=1
+            elif ! grep -qE "[ )]$sym([ (]|\$)" "$spec"; then echo "::error::$sym not exported"; status=1; fi
+          done
+          exit $status
+
+  shellcheck:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n and shellcheck
+        run: |
+          files=$(git ls-files '*.sh')
+          for f in $files; do bash -n "$f"; done
+          shellcheck -S warning $files
+      - name: Dry-run smoke tests
+        run: |
+          ./scripts/build-proton.sh --help
+          ./scripts/build-proton.sh | grep -q 'DRY RUN'
+
+  report:
+    name: Compatibility report
+    runs-on: ubuntu-latest
+    needs: [hygiene]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate report
+        run: |
+          python3 tools/compatibility-report.py --format markdown >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/compatibility-report.py --format json > compatibility-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-report
+          path: compatibility-report.json

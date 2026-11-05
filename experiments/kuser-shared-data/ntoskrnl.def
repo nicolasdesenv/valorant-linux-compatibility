@@ -1,8 +1,23 @@
 LIBRARY ntoskrnl.exe
 EXPORTS
- DbgPrint
- IoCreateDevice
+    DbgPrint
+    IoCreateDevice
     IoCreateDeviceSecure
     IoCreateSymbolicLink
     RtlInitUnicodeString
     IofCompleteRequest
+    IoAllocateDriverObjectExtension
+    IoGetDriverObjectExtension
+    IoSizeofWorkItem
+    IoInitializeWorkItem
+    IoUninitializeWorkItem
+    KeIpiGenericCall
+    KeQuerySystemTimePrecise
+    ExInitializeRundownProtection
+    ExAcquireRundownProtection
+    ExReleaseRundownProtection
+    ExWaitForRundownProtectionRelease
+    ExInitializePushLock
+    ExAcquirePushLockExclusiveEx
+    ExReleasePushLockExclusiveEx
+

@@ -1,0 +1,614 @@
+From 168caa882dc54f2b4f5760252f23ea1a9c3d23aa Mon Sep 17 00:00:00 2001
+From: kadiryildiz283 <kadiry.ra@gmail.com>
+Date: Thu, 15 Oct 2026 11:44:03 +0300
+Subject: [PATCH] ntoskrnl: implement driver extensions, work-item init, IPI,
+ rundown, and pushlocks
+
+---
+ dlls/ntoskrnl.exe/ntoskrnl.c         | 136 +++++++++++++++++++-
+ dlls/ntoskrnl.exe/ntoskrnl.exe.spec  |  38 ++++--
+ dlls/ntoskrnl.exe/ntoskrnl_private.h |   1 +
+ dlls/ntoskrnl.exe/sync.c             | 185 +++++++++++++++++++++++++++
+ 4 files changed, 344 insertions(+), 16 deletions(-)
+
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.c b/dlls/ntoskrnl.exe/ntoskrnl.c
+index b3f4575..67ca393 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.c
++++ b/dlls/ntoskrnl.exe/ntoskrnl.c
+@@ -38,6 +38,8 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
+ BOOLEAN KdDebuggerEnabled = FALSE;
+ ULONG InitSafeBootMode = 0;
+ USHORT NtBuildNumber = 0;
++CCHAR KeNumberProcessors = 1;
++PVOID MmHighestUserAddress = (PVOID)0x7ffffffeffffULL;
+ 
+ extern LONG CALLBACK vectored_handler( EXCEPTION_POINTERS *ptrs );
+ 
+@@ -1061,6 +1063,12 @@ done:
+     return status;
+ }
+ 
++struct driver_obj_extension
++{
++    struct list entry;
++    void *id;
++};
++
+ /***********************************************************************
+  *           IoAllocateDriverObjectExtension  (NTOSKRNL.EXE.@)
+  */
+@@ -1069,9 +1077,39 @@ NTSTATUS WINAPI IoAllocateDriverObjectExtension( PDRIVER_OBJECT DriverObject,
+                                                  ULONG DriverObjectExtensionSize,
+                                                  PVOID *DriverObjectExtension )
+ {
+-    FIXME( "stub: %p, %p, %lu, %p\n", DriverObject, ClientIdentificationAddress,
+-            DriverObjectExtensionSize, DriverObjectExtension );
+-    return STATUS_NOT_IMPLEMENTED;
++    struct wine_driver *driver;
++    struct driver_obj_extension *ext, *cur;
++
++    TRACE( "(%p, %p, %lu, %p)\n", DriverObject, ClientIdentificationAddress,
++           DriverObjectExtensionSize, DriverObjectExtension );
++
++    if (!DriverObject || !DriverObjectExtension)
++        return STATUS_INVALID_PARAMETER;
++
++    *DriverObjectExtension = NULL;
++    driver = CONTAINING_RECORD( DriverObject, struct wine_driver, driver_obj );
++
++    if (!(ext = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
++                           sizeof(*ext) + DriverObjectExtensionSize )))
++        return STATUS_INSUFFICIENT_RESOURCES;
++
++    ext->id = ClientIdentificationAddress;
++
++    EnterCriticalSection( &drivers_cs );
++    LIST_FOR_EACH_ENTRY( cur, &driver->extensions, struct driver_obj_extension, entry )
++    {
++        if (cur->id == ClientIdentificationAddress)
++        {
++            LeaveCriticalSection( &drivers_cs );
++            HeapFree( GetProcessHeap(), 0, ext );
++            return STATUS_OBJECT_NAME_COLLISION;
++        }
++    }
++    list_add_tail( &driver->extensions, &ext->entry );
++    LeaveCriticalSection( &drivers_cs );
++
++    *DriverObjectExtension = ext + 1;
++    return STATUS_SUCCESS;
+ }
+ 
+ 
+@@ -1081,8 +1119,27 @@ NTSTATUS WINAPI IoAllocateDriverObjectExtension( PDRIVER_OBJECT DriverObject,
+ PVOID WINAPI IoGetDriverObjectExtension( PDRIVER_OBJECT DriverObject,
+                                          PVOID ClientIdentificationAddress )
+ {
+-    FIXME( "stub: %p, %p\n", DriverObject, ClientIdentificationAddress );
+-    return NULL;
++    struct wine_driver *driver;
++    struct driver_obj_extension *cur;
++    void *ret = NULL;
++
++    TRACE( "(%p, %p)\n", DriverObject, ClientIdentificationAddress );
++
++    if (!DriverObject) return NULL;
++    driver = CONTAINING_RECORD( DriverObject, struct wine_driver, driver_obj );
++
++    EnterCriticalSection( &drivers_cs );
++    LIST_FOR_EACH_ENTRY( cur, &driver->extensions, struct driver_obj_extension, entry )
++    {
++        if (cur->id == ClientIdentificationAddress)
++        {
++            ret = cur + 1;
++            break;
++        }
++    }
++    LeaveCriticalSection( &drivers_cs );
++
++    return ret;
+ }
+ 
+ 
+@@ -1258,6 +1315,34 @@ struct _IO_WORKITEM
+     void *context;
+ };
+ 
++/***********************************************************************
++ *           IoSizeofWorkItem  (NTOSKRNL.EXE.@)
++ */
++ULONG WINAPI IoSizeofWorkItem(void)
++{
++    return sizeof(struct _IO_WORKITEM);
++}
++
++/***********************************************************************
++ *           IoInitializeWorkItem  (NTOSKRNL.EXE.@)
++ */
++void WINAPI IoInitializeWorkItem( PVOID io_object, PIO_WORKITEM work_item )
++{
++    TRACE( "(%p, %p)\n", io_object, work_item );
++
++    memset( work_item, 0, sizeof(*work_item) );
++    work_item->device = io_object;
++}
++
++/***********************************************************************
++ *           IoUninitializeWorkItem  (NTOSKRNL.EXE.@)
++ */
++void WINAPI IoUninitializeWorkItem( PIO_WORKITEM work_item )
++{
++    TRACE( "(%p)\n", work_item );
++    memset( work_item, 0, sizeof(*work_item) );
++}
++
+ /***********************************************************************
+  *           IoAllocateWorkItem  (NTOSKRNL.EXE.@)
+  */
+@@ -1268,7 +1353,7 @@ PIO_WORKITEM WINAPI IoAllocateWorkItem( PDEVICE_OBJECT device )
+     TRACE( "%p\n", device );
+ 
+     if (!(work_item = ExAllocatePool( PagedPool, sizeof(*work_item) ))) return NULL;
+-    work_item->device = device;
++    IoInitializeWorkItem( device, work_item );
+     return work_item;
+ }
+ 
+@@ -1279,6 +1364,7 @@ PIO_WORKITEM WINAPI IoAllocateWorkItem( PDEVICE_OBJECT device )
+ void WINAPI IoFreeWorkItem( PIO_WORKITEM work_item )
+ {
+     TRACE( "%p\n", work_item );
++    IoUninitializeWorkItem( work_item );
+     ExFreePool( work_item );
+ }
+ 
+@@ -1514,6 +1600,14 @@ static NTSTATUS WINAPI unhandled_irp( DEVICE_OBJECT *device, IRP *irp )
+ static void free_driver_object( void *obj )
+ {
+     struct wine_driver *driver = obj;
++    struct driver_obj_extension *ext, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( ext, next, &driver->extensions, struct driver_obj_extension, entry )
++    {
++        list_remove( &ext->entry );
++        HeapFree( GetProcessHeap(), 0, ext );
++    }
++
+     RtlFreeUnicodeString( &driver->driver_obj.DriverName );
+     RtlFreeUnicodeString( &driver->driver_obj.DriverExtension->ServiceKeyName );
+     free_kernel_object( driver );
+@@ -1559,6 +1653,7 @@ NTSTATUS WINAPI IoCreateDriver( UNICODE_STRING *name, PDRIVER_INITIALIZE init )
+     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+         driver->driver_obj.MajorFunction[i] = unhandled_irp;
+     list_init( &driver->root_pnp_devices );
++    list_init( &driver->extensions );
+ 
+     EnterCriticalSection( &drivers_cs );
+     if (wine_rb_put( &wine_drivers, &driver->driver_obj.DriverName, &driver->entry ))
+@@ -2708,6 +2803,15 @@ void WINAPI KeQuerySystemTime( LARGE_INTEGER *time )
+     NtQuerySystemTime( time );
+ }
+ 
++/***********************************************************************
++ *           KeQuerySystemTimePrecise   (NTOSKRNL.EXE.@)
++ */
++void WINAPI KeQuerySystemTimePrecise( LARGE_INTEGER *time )
++{
++    TRACE( "(%p)\n", time );
++    NtQuerySystemTime( time );
++}
++
+ 
+ /***********************************************************************
+  *           KeQueryTickCount   (NTOSKRNL.EXE.@)
+@@ -4645,6 +4749,19 @@ KPROCESSOR_MODE WINAPI ExGetPreviousMode(void)
+     return PsIsSystemThread((PETHREAD)KeGetCurrentThread()) ? KernelMode : UserMode;
+ }
+ 
++typedef ULONG_PTR (WINAPI *PKIPI_BROADCAST_WORKER)(ULONG_PTR argument);
++
++/***********************************************************************
++ *           KeIpiGenericCall   (NTOSKRNL.EXE.@)
++ */
++ULONG_PTR WINAPI KeIpiGenericCall( PKIPI_BROADCAST_WORKER broadcast_function, ULONG_PTR context )
++{
++    TRACE( "(%p, %#Ix)\n", broadcast_function, context );
++
++    if (!broadcast_function) return 0;
++    return broadcast_function( context );
++}
++
+ #ifdef __x86_64__
+ 
+ void WINAPI KfRaiseIrql(KIRQL new, KIRQL *old)
+@@ -4657,6 +4774,12 @@ void WINAPI KeLowerIrql(KIRQL new)
+     FIXME("new %u: stub.\n", new);
+ }
+ 
++KIRQL WINAPI KeGetCurrentIrql(void)
++{
++    TRACE("\n");
++    return PASSIVE_LEVEL;
++}
++
+ #endif
+ 
+ typedef void (WINAPI *PETW_CLASSIC_CALLBACK)(
+@@ -4695,6 +4818,7 @@ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, LPVOID reserved )
+ #endif
+         KeQueryTickCount( &count );  /* initialize the global KeTickCount */
+         NtBuildNumber = NtCurrentTeb()->Peb->OSBuildNumber;
++        KeNumberProcessors = (CCHAR)NtCurrentTeb()->Peb->NumberOfProcessors;
+         ntoskrnl_heap = HeapCreate( HEAP_CREATE_ENABLE_EXECUTE, 0, 0 );
+         dpc_call_tls_index = TlsAlloc();
+         LdrRegisterDllNotification( 0, ldr_notify_callback, NULL, &ldr_notify_cookie );
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+index 4426e50..6e21961 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
++++ b/dlls/ntoskrnl.exe/ntoskrnl.exe.spec
+@@ -2,22 +2,25 @@
+ @ stdcall EtwUnregister(int64)
+ @ stdcall -arch=!i386 ExAcquireFastMutex(ptr)
+ @ stdcall -fastcall ExAcquireFastMutexUnsafe(ptr)
+-@ stub ExAcquireRundownProtection
+-@ stub ExAcquireRundownProtectionEx
+-@ stub ExInitializeRundownProtection
++@ stdcall -fastcall ExAcquireRundownProtection(ptr)
++@ stdcall -fastcall ExAcquireRundownProtectionCacheAwareEx(ptr long)
++@ stdcall -fastcall ExAcquireRundownProtectionEx(ptr long)
++@ stdcall -fastcall ExInitializeRundownProtection(ptr)
+ @ stub ExInterlockedAddLargeStatistic
+ @ stub ExInterlockedCompareExchange64
+ @ stdcall -fastcall -arch=i386 ExInterlockedFlushSList(ptr) NTOSKRNL_ExInterlockedFlushSList
+ @ stdcall -fastcall -arch=i386 ExInterlockedPopEntrySList(ptr ptr) NTOSKRNL_ExInterlockedPopEntrySList
+ @ stdcall -fastcall -arch=i386 ExInterlockedPushEntrySList (ptr ptr ptr) NTOSKRNL_ExInterlockedPushEntrySList
+-@ stub ExReInitializeRundownProtection
++@ stdcall -fastcall ExReInitializeRundownProtection(ptr)
+ @ stdcall -arch=!i386 ExReleaseFastMutex(ptr)
+ @ stdcall -fastcall ExReleaseFastMutexUnsafe(ptr)
+ @ stdcall -fastcall ExReleaseResourceLite(ptr)
+-@ stub ExReleaseRundownProtection
+-@ stub ExReleaseRundownProtectionEx
+-@ stub ExRundownCompleted
+-@ stub ExWaitForRundownProtectionRelease
++@ stdcall -fastcall ExReleaseRundownProtection(ptr)
++@ stdcall -fastcall ExReleaseRundownProtectionCacheAwareEx(ptr long)
++@ stdcall -fastcall ExReleaseRundownProtectionEx(ptr long)
++@ stdcall -fastcall ExRundownCompleted(ptr)
++@ stdcall -fastcall ExWaitForRundownProtectionRelease(ptr)
++@ stdcall -fastcall ExWaitForRundownProtectionReleaseCacheAware(ptr)
+ @ stub ExfAcquirePushLockExclusive
+ @ stub ExfAcquirePushLockShared
+ @ stub ExfInterlockedAddUlong
+@@ -52,12 +55,16 @@
+ @ stdcall -fastcall IofCompleteRequest(ptr long)
+ @ stdcall -arch=!i386 KeAcquireInStackQueuedSpinLock(ptr ptr)
+ @ stdcall -fastcall KeAcquireInStackQueuedSpinLockAtDpcLevel(ptr ptr)
++@ stdcall -fastcall KeAcquireGuardedMutexUnsafe(ptr)
++@ stdcall -fastcall KeAcquireGuardedMutex(ptr)
+ @ stdcall KeEnterGuardedRegion()
+ @ stdcall KeExpandKernelStackAndCallout(ptr ptr long)
+ @ stdcall KeExpandKernelStackAndCalloutEx(ptr ptr long long ptr)
+ @ stdcall KeLeaveGuardedRegion()
+ @ stdcall -arch=!i386 KeReleaseInStackQueuedSpinLock(ptr)
+ @ stdcall -fastcall KeReleaseInStackQueuedSpinLockFromDpcLevel(ptr)
++@ stdcall -fastcall KeReleaseGuardedMutexUnsafe(ptr)
++@ stdcall -fastcall KeReleaseGuardedMutex(ptr)
+ @ stub KeSetTimeUpdateNotifyRoutine
+ @ stub KefAcquireSpinLockAtDpcLevel
+ @ stub KefReleaseSpinLockFromDpcLevel
+@@ -129,10 +136,12 @@
+ @ stub DbgPrompt
+ @ stdcall DbgQueryDebugFilterState(long long)
+ @ stub DbgSetDebugFilterState
++@ stdcall ExAcquirePushLockExclusiveEx(ptr long)
+ @ stdcall ExAcquireResourceExclusiveLite(ptr long)
+ @ stdcall ExAcquireResourceSharedLite(ptr long)
+ @ stdcall ExAcquireSharedStarveExclusive(ptr long)
+ @ stdcall ExAcquireSharedWaitForExclusive(ptr long)
++@ stdcall ExAllocateCacheAwareRundownProtection(long long)
+ @ stub ExAllocateFromPagedLookasideList
+ @ stdcall ExAllocatePool(long long)
+ @ stdcall ExAllocatePool2(int64 long long)
+@@ -151,6 +160,7 @@
+ @ extern ExEventObjectType
+ @ stub ExExtendZone
+ @ stdcall -fastcall ExfUnblockPushLock(ptr ptr)
++@ stdcall ExFreeCacheAwareRundownProtection(ptr)
+ @ stdcall ExFreePool(ptr)
+ @ stdcall ExFreePoolWithTag(ptr long)
+ @ stub ExFreeToPagedLookasideList
+@@ -161,6 +171,7 @@
+ @ stdcall ExGetSharedWaiterCount(ptr)
+ @ stdcall ExInitializeNPagedLookasideList(ptr ptr ptr long long long long)
+ @ stdcall ExInitializePagedLookasideList(ptr ptr ptr long long long long)
++@ stdcall ExInitializePushLock(ptr)
+ @ stdcall ExInitializeResourceLite(ptr)
+ @ stdcall ExInitializeZone(ptr long ptr long)
+ @ stub ExInterlockedAddLargeInteger
+@@ -188,6 +199,7 @@
+ @ stub ExRaiseStatus
+ @ stdcall ExRegisterCallback(ptr ptr ptr)
+ @ stub ExReinitializeResourceLite
++@ stdcall ExReleasePushLockExclusiveEx(ptr long)
+ @ stdcall ExReleaseResourceForThreadLite(ptr long)
+ @ extern ExSemaphoreObjectType
+ @ stub ExSetResourceOwnerPointer
+@@ -424,6 +436,7 @@
+ @ stdcall IoInitializeIrp(ptr long long)
+ @ stdcall IoInitializeRemoveLockEx(ptr long long long long)
+ @ stdcall IoInitializeTimer(ptr ptr ptr)
++@ stdcall IoInitializeWorkItem(ptr ptr)
+ @ stdcall IoInvalidateDeviceRelations(ptr long)
+ @ stub IoInvalidateDeviceState
+ @ stdcall -arch=win64 IoIs32bitProcess(ptr)
+@@ -485,6 +498,7 @@
+ @ stub IoSetSystemPartition
+ @ stdcall IoSetThreadHardErrorMode(long)
+ @ stub IoSetTopLevelIrp
++@ stdcall IoSizeofWorkItem()
+ @ stdcall IoStartNextPacket(ptr long)
+ @ stub IoStartNextPacketByKey
+ @ stub IoStartPacket
+@@ -494,6 +508,7 @@
+ @ stub IoSynchronousInvalidateDeviceRelations
+ @ stub IoSynchronousPageWrite
+ @ stub IoThreadToProcess
++@ stdcall IoUninitializeWorkItem(ptr)
+ @ stdcall IoUnregisterFileSystem(ptr)
+ @ stub IoUnregisterFsRegistrationChange
+ @ stdcall IoUnregisterPlugPlayNotification(ptr)
+@@ -560,6 +575,7 @@
+ @ stub KeFindConfigurationNextEntry
+ @ stub KeFlushEntireTb
+ @ stdcall KeFlushQueuedDpcs()
++@ stdcall -arch=x86_64 KeGetCurrentIrql()
+ @ stdcall KeGetCurrentProcessorNumber() NtGetCurrentProcessorNumber
+ @ stdcall KeGetCurrentProcessorNumberEx(ptr)
+ @ stdcall KeGetCurrentThread()
+@@ -595,12 +611,13 @@
+ @ stdcall KeInsertQueue(ptr ptr)
+ @ stub KeInsertQueueApc
+ @ stdcall KeInsertQueueDpc(ptr ptr ptr)
++@ stdcall KeIpiGenericCall(ptr long)
+ @ stub KeIsAttachedProcess
+ @ stub KeIsExecutingDpc
+ @ stdcall KeLeaveCriticalRegion()
+ @ stub KeLoaderBlock
+ @ stdcall -arch=x86_64 KeLowerIrql(long)
+-@ stub KeNumberProcessors
++@ extern KeNumberProcessors
+ @ stub KeProfileInterrupt
+ @ stub KeProfileInterruptWithSource
+ @ stub KePulseEvent
+@@ -613,6 +630,7 @@
+ @ stdcall KeQueryPriorityThread(ptr)
+ @ stub KeQueryRuntimeThread
+ @ stdcall KeQuerySystemTime(ptr)
++@ stdcall KeQuerySystemTimePrecise(ptr)
+ @ stdcall KeQueryTickCount(ptr)
+ @ stdcall KeQueryTimeIncrement()
+ @ stdcall KeQueryMaximumGroupCount() GetMaximumProcessorGroupCount
+@@ -727,7 +745,7 @@
+ @ stdcall MmGetSystemRoutineAddress(ptr)
+ @ stub MmGetVirtualForPhysical
+ @ stub MmGrowKernelStack
+-@ stub MmHighestUserAddress
++@ extern MmHighestUserAddress
+ @ stdcall MmIsAddressValid(ptr)
+ @ stub MmIsDriverVerifying
+ @ stub MmIsNonPagedSystemAddressValid
+diff --git a/dlls/ntoskrnl.exe/ntoskrnl_private.h b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+index 7e0f3cf..8258077 100644
+--- a/dlls/ntoskrnl.exe/ntoskrnl_private.h
++++ b/dlls/ntoskrnl.exe/ntoskrnl_private.h
+@@ -97,6 +97,7 @@ struct wine_driver
+     SERVICE_STATUS_HANDLE service_handle;
+     struct wine_rb_entry entry;
+     struct list root_pnp_devices;
++    struct list extensions;
+ };
+ 
+ void ObReferenceObject( void *obj );
+diff --git a/dlls/ntoskrnl.exe/sync.c b/dlls/ntoskrnl.exe/sync.c
+index 2183df3..fef95f9 100644
+--- a/dlls/ntoskrnl.exe/sync.c
++++ b/dlls/ntoskrnl.exe/sync.c
+@@ -438,6 +438,42 @@ void WINAPI KeInitializeGuardedMutex(PKGUARDED_MUTEX mutex)
+     KeInitializeEvent(&mutex->Event, SynchronizationEvent, FALSE);
+ }
+ 
++/***********************************************************************
++ *           KeAcquireGuardedMutexUnsafe   (NTOSKRNL.EXE.@)
++ */
++DEFINE_FASTCALL1_WRAPPER(KeAcquireGuardedMutexUnsafe)
++void FASTCALL KeAcquireGuardedMutexUnsafe(PKGUARDED_MUTEX mutex)
++{
++    ExAcquireFastMutexUnsafe((PFAST_MUTEX)mutex);
++}
++
++/***********************************************************************
++ *           KeAcquireGuardedMutex   (NTOSKRNL.EXE.@)
++ */
++DEFINE_FASTCALL1_WRAPPER(KeAcquireGuardedMutex)
++void FASTCALL KeAcquireGuardedMutex(PKGUARDED_MUTEX mutex)
++{
++    KeAcquireGuardedMutexUnsafe(mutex);
++}
++
++/***********************************************************************
++ *           KeReleaseGuardedMutexUnsafe   (NTOSKRNL.EXE.@)
++ */
++DEFINE_FASTCALL1_WRAPPER(KeReleaseGuardedMutexUnsafe)
++void FASTCALL KeReleaseGuardedMutexUnsafe(PKGUARDED_MUTEX mutex)
++{
++    ExReleaseFastMutexUnsafe((PFAST_MUTEX)mutex);
++}
++
++/***********************************************************************
++ *           KeReleaseGuardedMutex   (NTOSKRNL.EXE.@)
++ */
++DEFINE_FASTCALL1_WRAPPER(KeReleaseGuardedMutex)
++void FASTCALL KeReleaseGuardedMutex(PKGUARDED_MUTEX mutex)
++{
++    KeReleaseGuardedMutexUnsafe(mutex);
++}
++
+ static void CALLBACK ke_timer_complete_proc(PTP_CALLBACK_INSTANCE instance, void *timer_, PTP_TIMER tp_timer)
+ {
+     KTIMER *timer = timer_;
+@@ -1450,3 +1486,151 @@ KDEVICE_QUEUE_ENTRY *WINAPI KeRemoveDeviceQueue( KDEVICE_QUEUE *queue )
+ 
+     return entry;
+ }
++
++#define EX_RUNDOWN_ACTIVE 1
++
++typedef struct _EX_RUNDOWN_REF
++{
++    ULONG_PTR Count;
++} EX_RUNDOWN_REF, *PEX_RUNDOWN_REF, *PEX_RUNDOWN_REF_CACHE_AWARE;
++
++DEFINE_FASTCALL1_WRAPPER(ExInitializeRundownProtection)
++void FASTCALL ExInitializeRundownProtection( PEX_RUNDOWN_REF ref )
++{
++    TRACE( "ref %p.\n", ref );
++    InterlockedExchangePointer( (void **)&ref->Count, 0 );
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExReInitializeRundownProtection)
++void FASTCALL ExReInitializeRundownProtection( PEX_RUNDOWN_REF ref )
++{
++    TRACE( "ref %p.\n", ref );
++    InterlockedExchangePointer( (void **)&ref->Count, 0 );
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExRundownCompleted)
++void FASTCALL ExRundownCompleted( PEX_RUNDOWN_REF ref )
++{
++    TRACE( "ref %p.\n", ref );
++    InterlockedExchangePointer( (void **)&ref->Count, (void *)EX_RUNDOWN_ACTIVE );
++}
++
++DEFINE_FASTCALL_WRAPPER(ExAcquireRundownProtectionEx, 8)
++BOOLEAN FASTCALL ExAcquireRundownProtectionEx( PEX_RUNDOWN_REF ref, ULONG count )
++{
++    ULONG_PTR cur, next;
++
++    TRACE( "ref %p, count %lu.\n", ref, count );
++
++    for (;;)
++    {
++        cur = ref->Count;
++        if (cur & EX_RUNDOWN_ACTIVE) return FALSE;
++        next = cur + ((ULONG_PTR)count << 1);
++        if ((ULONG_PTR)InterlockedCompareExchangePointer( (void **)&ref->Count,
++                (void *)next, (void *)cur ) == cur)
++            return TRUE;
++    }
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExAcquireRundownProtection)
++BOOLEAN FASTCALL ExAcquireRundownProtection( PEX_RUNDOWN_REF ref )
++{
++    return ExAcquireRundownProtectionEx( ref, 1 );
++}
++
++DEFINE_FASTCALL_WRAPPER(ExReleaseRundownProtectionEx, 8)
++void FASTCALL ExReleaseRundownProtectionEx( PEX_RUNDOWN_REF ref, ULONG count )
++{
++    ULONG_PTR cur, next;
++
++    TRACE( "ref %p, count %lu.\n", ref, count );
++
++    for (;;)
++    {
++        cur = ref->Count;
++        next = cur - ((ULONG_PTR)count << 1);
++        if ((ULONG_PTR)InterlockedCompareExchangePointer( (void **)&ref->Count,
++                (void *)next, (void *)cur ) == cur)
++            return;
++    }
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExReleaseRundownProtection)
++void FASTCALL ExReleaseRundownProtection( PEX_RUNDOWN_REF ref )
++{
++    ExReleaseRundownProtectionEx( ref, 1 );
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExWaitForRundownProtectionRelease)
++void FASTCALL ExWaitForRundownProtectionRelease( PEX_RUNDOWN_REF ref )
++{
++    ULONG_PTR cur;
++
++    TRACE( "ref %p.\n", ref );
++
++    for (;;)
++    {
++        cur = ref->Count;
++        if (cur & EX_RUNDOWN_ACTIVE) break;
++        if ((ULONG_PTR)InterlockedCompareExchangePointer( (void **)&ref->Count,
++                (void *)(cur | EX_RUNDOWN_ACTIVE), (void *)cur ) == cur)
++            break;
++    }
++
++    while (ref->Count != EX_RUNDOWN_ACTIVE)
++        YieldProcessor();
++}
++
++PEX_RUNDOWN_REF_CACHE_AWARE WINAPI ExAllocateCacheAwareRundownProtection( POOL_TYPE pool_type, ULONG tag )
++{
++    PEX_RUNDOWN_REF_CACHE_AWARE ref;
++
++    TRACE( "pool_type %u, tag %#lx.\n", pool_type, tag );
++
++    if (!(ref = ExAllocatePoolWithTag( pool_type, sizeof(*ref), tag ))) return NULL;
++    ExInitializeRundownProtection( ref );
++    return ref;
++}
++
++void WINAPI ExFreeCacheAwareRundownProtection( PEX_RUNDOWN_REF_CACHE_AWARE ref )
++{
++    TRACE( "ref %p.\n", ref );
++    ExFreePool( ref );
++}
++
++DEFINE_FASTCALL_WRAPPER(ExAcquireRundownProtectionCacheAwareEx, 8)
++BOOLEAN FASTCALL ExAcquireRundownProtectionCacheAwareEx( PEX_RUNDOWN_REF_CACHE_AWARE ref, ULONG count )
++{
++    return ExAcquireRundownProtectionEx( ref, count );
++}
++
++DEFINE_FASTCALL_WRAPPER(ExReleaseRundownProtectionCacheAwareEx, 8)
++void FASTCALL ExReleaseRundownProtectionCacheAwareEx( PEX_RUNDOWN_REF_CACHE_AWARE ref, ULONG count )
++{
++    ExReleaseRundownProtectionEx( ref, count );
++}
++
++DEFINE_FASTCALL1_WRAPPER(ExWaitForRundownProtectionReleaseCacheAware)
++void FASTCALL ExWaitForRundownProtectionReleaseCacheAware( PEX_RUNDOWN_REF_CACHE_AWARE ref )
++{
++    ExWaitForRundownProtectionRelease( ref );
++}
++
++void WINAPI ExInitializePushLock( PULONG_PTR push_lock )
++{
++    TRACE( "push_lock %p.\n", push_lock );
++    *push_lock = 0;
++}
++
++void WINAPI ExAcquirePushLockExclusiveEx( PULONG_PTR push_lock, ULONG flags )
++{
++    TRACE( "push_lock %p, flags %#lx.\n", push_lock, flags );
++    AcquireSRWLockExclusive( (SRWLOCK *)push_lock );
++}
++
++void WINAPI ExReleasePushLockExclusiveEx( PULONG_PTR push_lock, ULONG flags )
++{
++    TRACE( "push_lock %p, flags %#lx.\n", push_lock, flags );
++    ReleaseSRWLockExclusive( (SRWLOCK *)push_lock );
++}
+-- 
+2.56.0
+
